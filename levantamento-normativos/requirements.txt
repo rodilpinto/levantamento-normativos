@@ -1,0 +1,6 @@
+streamlit>=1.33.0
+requests
+openpyxl
+beautifulsoup4
+google-generativeai
+googlesearch-python
