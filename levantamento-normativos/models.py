@@ -77,6 +77,30 @@ class NormativoResult:
 
 
 @dataclass
+class KeywordStatus:
+    """Status of a keyword search across a specific source.
+
+    Tracks whether a keyword returned results, returned zero results
+    (legitimately not found), or failed due to an API/network error.
+
+    Attributes:
+        keyword: The search term.
+        source: Which searcher produced this status ("lexml", "tcu", "google").
+        result_count: Number of results found (0 if not found or error).
+        status: One of "ok", "empty", "error".
+        error_message: Error description if status == "error", else empty.
+        retried: Whether this keyword was retried after an initial error.
+    """
+
+    keyword: str
+    source: str
+    result_count: int = 0
+    status: str = "ok"  # "ok" | "empty" | "error"
+    error_message: str = ""
+    retried: bool = False
+
+
+@dataclass
 class SearchConfig:
     """Configuracao de uma sessao de busca.
 

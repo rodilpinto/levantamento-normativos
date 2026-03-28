@@ -18,7 +18,7 @@ from collections import Counter
 import pandas as pd
 import streamlit as st
 
-from models import NormativoResult
+from models import KeywordStatus, NormativoResult
 from searchers import LexMLSearcher, TCUSearcher, GoogleSearcher
 from llm import gemini_client
 from llm.gemini_client import is_available as llm_available
@@ -119,6 +119,7 @@ _DEFAULTS: dict = {
     # Step 3
     "search_done": False,
     "results": [],
+    "keyword_statuses": [],
     # Step 5
     "excel_buffer": None,
 }
@@ -182,11 +183,17 @@ def _get_tipo_color(tipo: str) -> str:
 def _make_filename_slug(topic: str) -> str:
     """Convert a topic string into a filesystem-safe filename slug.
 
-    Transforms to lowercase, removes special characters, replaces whitespace
-    with underscores, and truncates to 60 characters for Windows path safety.
+    Transforms to lowercase, removes accents/diacritics, removes special
+    characters, replaces whitespace with underscores, and truncates to
+    60 characters for Windows path safety.
     """
+    import unicodedata as _ud
+
     slug = topic.lower().strip()
-    slug = _re.sub(r"[^\w\s]", "", slug)
+    # Remove accents: decompose unicode, drop combining marks, recompose
+    nfkd = _ud.normalize("NFKD", slug)
+    slug = "".join(ch for ch in nfkd if not _ud.combining(ch))
+    slug = _re.sub(r"[^\w\s]", "", slug, flags=_re.ASCII)
     slug = _re.sub(r"\s+", "_", slug)
     return slug[:60]
 
@@ -513,6 +520,7 @@ def _execute_search(
         status_text = st.empty()
 
         all_results: list[NormativoResult] = []
+        all_keyword_statuses: list[KeywordStatus] = []
         searchers = _get_selected_searchers(selected_sources)
         total_sources = len(searchers)
 
@@ -541,6 +549,10 @@ def _execute_search(
                     progress_callback=cb,
                 )
                 all_results.extend(results)
+
+                # Collect keyword-level diagnostics
+                if hasattr(searcher, "keyword_statuses"):
+                    all_keyword_statuses.extend(searcher.keyword_statuses)
             except Exception as e:
                 # Log the error but continue with other sources
                 logger.error(
@@ -589,9 +601,10 @@ def _execute_search(
             state="complete",
         )
 
-    # Store results and advance to Step 4
+    # Store results and diagnostics, advance to Step 4
     st.session_state["results"] = all_results
     st.session_state["search_done"] = True
+    st.session_state["keyword_statuses"] = all_keyword_statuses
 
     # Initialize checkboxes for all results (default: selected)
     for i in range(len(all_results)):
@@ -617,6 +630,7 @@ def render_step3() -> None:
             if st.button("Refazer Busca", use_container_width=True):
                 st.session_state["search_done"] = False
                 st.session_state["results"] = []
+                st.session_state["keyword_statuses"] = []
                 # Clear stale selection checkboxes from previous search
                 for key in list(st.session_state.keys()):
                     if key.startswith("sel_"):
@@ -823,17 +837,102 @@ def _count_selected(count: int) -> int:
     )
 
 
+def _render_search_diagnostics(
+    kw_statuses: list[KeywordStatus],
+    error_statuses: list[KeywordStatus],
+    empty_statuses: list[KeywordStatus],
+    ok_statuses: list[KeywordStatus],
+) -> None:
+    """Render the search diagnostics expander with per-keyword status."""
+    if not kw_statuses:
+        return
+
+    n_err = len(error_statuses)
+    n_empty = len(empty_statuses)
+    n_ok = len(ok_statuses)
+    total = len(kw_statuses)
+
+    label = f"Relatorio da busca ({n_ok} OK, {n_err} erros, {n_empty} sem resultados) — {total} total"
+
+    with st.expander(label, expanded=bool(error_statuses)):
+        # Summary metrics
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Total de buscas", total)
+        with col2:
+            st.metric("Sucesso", n_ok)
+        with col3:
+            st.metric("Sem resultados", n_empty)
+        with col4:
+            st.metric("Erros", n_err)
+
+        if error_statuses:
+            st.markdown("**:red[Palavras-chave com erro (API indisponivel ou bloqueio):]**")
+            for s in error_statuses:
+                retry_badge = " (retentado)" if s.retried else ""
+                st.markdown(
+                    f"- :red[**{html_module.escape(s.keyword)}**] "
+                    f"em *{html_module.escape(s.source)}*{retry_badge}: "
+                    f"`{html_module.escape(s.error_message)}`"
+                )
+            st.caption(
+                "Essas palavras-chave nao retornaram resultados devido a "
+                "erros de rede ou API. Isso NAO significa que nao existem "
+                "normativos — apenas que a busca falhou. Considere refazer "
+                "a busca mais tarde."
+            )
+
+        if empty_statuses:
+            st.markdown("**:orange[Palavras-chave sem resultados (nenhum normativo encontrado):]**")
+            for s in empty_statuses:
+                st.markdown(
+                    f"- :orange[**{html_module.escape(s.keyword)}**] "
+                    f"em *{html_module.escape(s.source)}*"
+                )
+            st.caption(
+                "Essas palavras-chave foram buscadas com sucesso, mas "
+                "nenhum normativo correspondente foi encontrado na fonte."
+            )
+
+        if ok_statuses:
+            st.markdown("**:green[Palavras-chave com resultados:]**")
+            for s in ok_statuses:
+                st.markdown(
+                    f"- :green[**{html_module.escape(s.keyword)}**] "
+                    f"em *{html_module.escape(s.source)}*: "
+                    f"{s.result_count} resultado(s)"
+                )
+
+
 def render_step4() -> None:
     """Passo 4: Revisar resultados com filtros, ordenacao e selecao."""
 
     results: list[NormativoResult] = st.session_state.get("results", [])
 
+    # --- Keyword diagnostics (shown regardless of result count) ---
+    kw_statuses: list[KeywordStatus] = st.session_state.get("keyword_statuses", [])
+    error_statuses = [s for s in kw_statuses if s.status == "error"]
+    empty_statuses = [s for s in kw_statuses if s.status == "empty"]
+    ok_statuses = [s for s in kw_statuses if s.status == "ok"]
+
     if not results:
         st.header("Passo 4 - Revisar Resultados")
-        st.info(
-            "Nenhum normativo encontrado para as palavras-chave informadas. "
-            "Tente ampliar as palavras-chave ou selecionar fontes adicionais."
-        )
+
+        if error_statuses:
+            st.error(
+                f"Nenhum normativo encontrado. "
+                f"{len(error_statuses)} busca(s) falharam por erro de API. "
+                f"A fonte pode estar indisponivel — tente novamente mais tarde."
+            )
+        else:
+            st.info(
+                "Nenhum normativo encontrado para as palavras-chave informadas. "
+                "Tente ampliar as palavras-chave ou selecionar fontes adicionais."
+            )
+
+        # Show diagnostics even when no results
+        _render_search_diagnostics(kw_statuses, error_statuses, empty_statuses, ok_statuses)
+
         if st.button("<< Voltar para Busca"):
             st.session_state["search_done"] = False
             go_to_step(3)
@@ -843,6 +942,8 @@ def render_step4() -> None:
     _init_checkboxes(results)
 
     st.header(f"Passo 4 - Revisar Resultados ({len(results)} normativos)")
+
+    _render_search_diagnostics(kw_statuses, error_statuses, empty_statuses, ok_statuses)
 
     # --- Filter bar ---
     col_tipo, col_fonte, col_rel, col_sort = st.columns([1, 1, 1, 1])
@@ -1007,6 +1108,14 @@ def render_step4() -> None:
             use_container_width=True,
             key="step4_next",
         ):
+            # Save selection to a durable key before navigating away.
+            # Streamlit clears widget keys (sel_0, sel_1, ...) when the
+            # checkboxes are not rendered on the next page. We persist
+            # the selection as a list of indices so Step 5 can read it.
+            st.session_state["selected_indices"] = [
+                i for i in range(len(results))
+                if st.session_state.get(f"sel_{i}", False)
+            ]
             go_to_step(5)
             st.rerun()
 
@@ -1023,12 +1132,18 @@ def render_step5() -> None:
 
     results: list[NormativoResult] = st.session_state.get("results", [])
 
-    # Gather selected items
-    selected = [
-        item
-        for i, item in enumerate(results)
-        if st.session_state.get(f"sel_{i}", False)
-    ]
+    # Gather selected items. Use the durable "selected_indices" key saved
+    # by Step 4 (checkbox widget keys are cleared when not rendered).
+    selected_indices = st.session_state.get("selected_indices", [])
+    if selected_indices:
+        selected = [results[i] for i in selected_indices if i < len(results)]
+    else:
+        # Fallback: try widget keys (works if coming back from step 5)
+        selected = [
+            item
+            for i, item in enumerate(results)
+            if st.session_state.get(f"sel_{i}", False)
+        ]
 
     if not selected:
         st.warning(

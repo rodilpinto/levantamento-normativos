@@ -41,6 +41,11 @@ _RE_PUNCTUATION = re.compile(r"[^\w\s]")
 # ID and tipo+numero matching are applied.
 _FUZZY_MAX_ITEMS = 1000
 
+# Minimum ementa length (after normalization) for fuzzy matching.
+# Very short ementas tend to produce false-positive matches because
+# the shared prefix dominates the SequenceMatcher ratio.
+_FUZZY_MIN_EMENTA_LEN = 60
+
 # Source authority ranking: lower index = higher authority
 _SOURCE_PRIORITY = {"lexml": 0, "tcu": 1, "google": 2}
 
@@ -245,7 +250,7 @@ def deduplicate(results: list[NormativoResult]) -> list[NormativoResult]:
         merged = False
         if not skip_fuzzy and result.ementa:
             normalized_incoming = _normalize(result.ementa)
-            if normalized_incoming:  # skip if ementa normalizes to empty
+            if len(normalized_incoming) >= _FUZZY_MIN_EMENTA_LEN:
                 for i, existing in enumerate(output):
                     normalized_existing = normalized_ementas[i]
                     if not normalized_existing:

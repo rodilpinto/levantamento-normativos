@@ -1,8 +1,10 @@
-"""Gemini Flash client for keyword expansion, relevance scoring, and categorization.
+"""Gemini client for keyword expansion, relevance scoring, and categorization.
 
-This module encapsulates all communication with the Google Gemini API. It is the
-ONLY module in the project that imports ``google.generativeai``. All other modules
-interact with Gemini exclusively through the public functions exported here.
+This module encapsulates all communication with the Google Gemini API using
+the ``google-genai`` SDK (successor to the deprecated ``google-generativeai``).
+It is the ONLY module in the project that imports ``google.genai``. All other
+modules interact with Gemini exclusively through the public functions exported
+here.
 
 Every public function degrades gracefully when no API key is configured:
 - expand_topic_to_keywords returns []
@@ -24,11 +26,27 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# SDK import — google-genai (new) with fallback to google-generativeai (deprecated)
+# ---------------------------------------------------------------------------
+
+_sdk: str = "none"  # "genai" | "legacy" | "none"
+
 try:
-    import google.generativeai as genai
+    from google import genai as _genai_new
+    from google.genai import types as _genai_types
+    _sdk = "genai"
+    logger.info("Using google-genai SDK (recommended).")
 except ImportError:
-    genai = None
-    logger.info("google-generativeai not installed — LLM features disabled.")
+    _genai_new = None
+    _genai_types = None
+    try:
+        import google.generativeai as _genai_legacy
+        _sdk = "legacy"
+        logger.info("Using deprecated google-generativeai SDK. Consider upgrading to google-genai.")
+    except ImportError:
+        _genai_legacy = None
+        logger.info("No Gemini SDK installed — LLM features disabled.")
 
 # ---------------------------------------------------------------------------
 # API Key Resolution
@@ -42,6 +60,14 @@ except Exception:
     api_key: str = os.environ.get("GEMINI_API_KEY", "")
 
 # ---------------------------------------------------------------------------
+# Model configuration
+# ---------------------------------------------------------------------------
+
+# gemini-2.5-flash-lite: best free-tier throughput (15 RPM, 1000/day)
+# gemini-2.5-flash: better quality but lower free-tier limits (10 RPM, 250/day)
+MODEL_NAME = "gemini-2.5-flash-lite"
+
+# ---------------------------------------------------------------------------
 # Lazy Singleton Client
 # ---------------------------------------------------------------------------
 
@@ -50,15 +76,15 @@ _no_key_logged: bool = False
 
 
 def _get_client():
-    """Return the singleton GenerativeModel instance, or None if unavailable.
+    """Return the singleton client instance, or None if unavailable.
 
-    Configures the SDK on first call. Subsequent calls return the cached instance.
-    Returns None if the google-generativeai package is not installed or no API key
-    is configured, allowing callers to fall back gracefully.
+    Supports both the new ``google-genai`` SDK and the deprecated
+    ``google-generativeai`` SDK. Returns None if no SDK is installed
+    or no API key is configured.
     """
     global _client, _no_key_logged
 
-    if genai is None:
+    if _sdk == "none":
         return None
 
     if _client is None:
@@ -67,18 +93,64 @@ def _get_client():
                 logger.info("GEMINI_API_KEY not configured — LLM features disabled.")
                 _no_key_logged = True
             return None
-        genai.configure(api_key=api_key)
-        _client = genai.GenerativeModel("gemini-2.0-flash")
+
+        if _sdk == "genai":
+            _client = _genai_new.Client(api_key=api_key)
+        else:
+            _genai_legacy.configure(api_key=api_key)
+            _client = _genai_legacy.GenerativeModel(MODEL_NAME)
+
     return _client
+
+
+def _generate(prompt: str, temperature: float = 0.0, max_tokens: int = 1024) -> Optional[str]:
+    """Generate text using whichever SDK is available.
+
+    Args:
+        prompt: The prompt text.
+        temperature: Sampling temperature (0.0 = deterministic).
+        max_tokens: Maximum output tokens.
+
+    Returns:
+        Response text string, or None on any error.
+    """
+    client = _get_client()
+    if client is None:
+        return None
+
+    try:
+        if _sdk == "genai":
+            response = client.models.generate_content(
+                model=MODEL_NAME,
+                contents=prompt,
+                config=_genai_types.GenerateContentConfig(
+                    temperature=temperature,
+                    max_output_tokens=max_tokens,
+                ),
+            )
+            return response.text if response.text else None
+        else:
+            # Legacy SDK
+            response = client.generate_content(
+                prompt,
+                generation_config=_genai_legacy.types.GenerationConfig(
+                    temperature=temperature,
+                    max_output_tokens=max_tokens,
+                ),
+            )
+            return response.text if response.text else None
+    except Exception as e:
+        logger.warning("Gemini API error: %s", e)
+        return None
 
 
 def is_available() -> bool:
     """Check if Gemini API is configured and available.
 
     Returns:
-        True if a non-empty API key was found at module load time.
+        True if a non-empty API key was found and a supported SDK is installed.
     """
-    return genai is not None and bool(api_key)
+    return _sdk != "none" and bool(api_key)
 
 
 # ---------------------------------------------------------------------------
@@ -89,8 +161,6 @@ BATCH_SIZE: int = 20
 """Maximum number of results to send in a single LLM call.
 
 Keeps prompt size under the token limit and improves response reliability.
-Gemini Flash supports 1M token context, but smaller prompts produce more
-accurate structured output.
 """
 
 CATEGORIES: list[str] = [
@@ -108,12 +178,7 @@ CATEGORIES: list[str] = [
     "Orçamento e Finanças",
     "Outro",
 ]
-"""Predefined thematic categories for normativo classification.
-
-Uses accented UTF-8 strings as the canonical category names throughout the
-application. The LLM is instructed to return one of these exact strings, and
-a fuzzy matcher handles minor variations in the response.
-"""
+"""Predefined thematic categories for normativo classification."""
 
 # ---------------------------------------------------------------------------
 # Private Helpers
@@ -124,7 +189,7 @@ def _parse_json_array(text: str) -> Optional[list]:
     """Extract and parse a JSON array from LLM response text.
 
     Handles common LLM output quirks:
-    - Markdown code fences (``\\`\\`\\`json ... \\`\\`\\``` or ``\\`\\`\\` ... \\`\\`\\```)
+    - Markdown code fences
     - Leading/trailing whitespace
     - Embedded arrays within explanation text
 
@@ -161,15 +226,7 @@ def _parse_json_array(text: str) -> Optional[list]:
 
 
 def _chunk_list(items: list, chunk_size: int) -> list[list]:
-    """Split a list into consecutive chunks of at most chunk_size elements.
-
-    Args:
-        items: The list to split.
-        chunk_size: Maximum number of elements per chunk.
-
-    Returns:
-        List of sub-lists, each with at most chunk_size elements.
-    """
+    """Split a list into consecutive chunks of at most chunk_size elements."""
     return [items[i:i + chunk_size] for i in range(0, len(items), chunk_size)]
 
 
@@ -177,8 +234,6 @@ def _keyword_relevance(keywords: list[str], ementa: str) -> float:
     """Estimate relevance by counting keyword matches in the ementa.
 
     This is a simple heuristic fallback used when the LLM is unavailable.
-    It counts how many of the search keywords appear (case-insensitive) in
-    the ementa text and normalizes by the total number of keywords.
 
     Args:
         keywords: List of search keywords to look for.
@@ -198,10 +253,7 @@ def _keyword_relevance(keywords: list[str], ementa: str) -> float:
 def _fuzzy_match_category(candidate: str) -> Optional[str]:
     """Attempt to match a candidate string to a known category.
 
-    Handles common LLM output variations:
-    - Case differences ("governança de ti" -> "Governança de TI")
-    - Missing accents ("Governanca" -> "Governança")
-    - Extra whitespace
+    Handles case differences, missing accents, and extra whitespace.
 
     Args:
         candidate: The category string returned by the LLM.
@@ -230,29 +282,20 @@ def _fuzzy_match_category(candidate: str) -> Optional[str]:
 def expand_topic_to_keywords(topic: str) -> list[str]:
     """Generate search keywords from a natural language topic description.
 
-    Uses Gemini Flash to expand a topic into a comprehensive list of search
+    Uses Gemini to expand a topic into a comprehensive list of search
     keywords for Brazilian legislation databases. If the LLM is unavailable,
-    returns an empty list -- the caller should then prompt the user to enter
-    keywords manually.
+    returns an empty list.
 
     Args:
         topic: Natural language description of the research topic in Portuguese.
-               Example: "governança de TI no setor público"
 
     Returns:
         List of 15-30 keyword strings in Portuguese, or an empty list if the
         LLM is unavailable or encounters an error.
-
-    Example:
-        >>> expand_topic_to_keywords("governança de TI")
-        ["governança de TI", "EGTI", "PDTIC", "SISP", "Decreto 10.332", ...]
     """
-    # Sanitize: truncate excessively long topic strings
     topic = (topic or "")[:500].strip()
 
-    # Guard: LLM unavailable
-    client = _get_client()
-    if client is None:
+    if not is_available():
         logger.info("Gemini unavailable — skipping keyword expansion.")
         return []
 
@@ -275,36 +318,23 @@ Exemplo de formato: ["palavra-chave 1", "palavra-chave 2", "palavra-chave 3"]
 
 Gere entre 15 e 30 palavras-chave.'''
 
-    try:
-        response = client.generate_content(
-            prompt,
-            generation_config=genai.types.GenerationConfig(
-                temperature=0.3,
-                max_output_tokens=1024,
-            ),
-        )
-
-        if not response.text:
-            logger.warning("Gemini returned empty response for keyword expansion.")
-            return []
-
-        parsed = _parse_json_array(response.text)
-        if parsed is None:
-            logger.warning("Failed to parse keyword list from Gemini response.")
-            return []
-
-        # Validate: must be a list of strings (coerce numeric values to str)
-        keywords = [str(item) for item in parsed if isinstance(item, (str, int, float))]
-        if not keywords:
-            logger.warning("Gemini returned empty or non-string keyword list.")
-            return []
-
-        logger.info("Gemini expanded topic into %d keywords.", len(keywords))
-        return keywords
-
-    except Exception as e:
-        logger.warning("Gemini API error during keyword expansion: %s", e)
+    text = _generate(prompt, temperature=0.3, max_tokens=1024)
+    if not text:
+        logger.warning("Gemini returned empty response for keyword expansion.")
         return []
+
+    parsed = _parse_json_array(text)
+    if parsed is None:
+        logger.warning("Failed to parse keyword list from Gemini response.")
+        return []
+
+    keywords = [str(item) for item in parsed if isinstance(item, (str, int, float))]
+    if not keywords:
+        logger.warning("Gemini returned empty or non-string keyword list.")
+        return []
+
+    logger.info("Gemini expanded topic into %d keywords.", len(keywords))
+    return keywords
 
 
 def score_relevance(
@@ -319,31 +349,18 @@ def score_relevance(
 
     Args:
         topic: The original research topic in natural language.
-        results: List of dicts, each containing at minimum:
-                 - "nome" (str): Name/identifier of the normativo
-                 - "ementa" (str): Summary/description text
-                 Additional keys are ignored.
+        results: List of dicts with "nome" and "ementa" keys.
         keywords: Optional list of search keywords for the fallback heuristic.
-                  Used only when the LLM is unavailable.
 
     Returns:
-        List of float scores in [0.0, 1.0], same length and order as ``results``.
-        Higher scores indicate greater relevance to the topic.
-
-    Example:
-        >>> score_relevance("LGPD", [{"nome": "Lei 13.709", "ementa": "Proteção de dados..."}])
-        [0.95]
+        List of float scores in [0.0, 1.0], same length and order as results.
     """
-    # Sanitize: truncate excessively long topic strings
     topic = (topic or "")[:500].strip()
 
     if not results:
         return []
 
-    client = _get_client()
-
-    # Fallback path: no LLM available
-    if client is None:
+    if not is_available():
         if keywords:
             logger.info("Gemini unavailable — using keyword heuristic for relevance.")
             return [
@@ -353,7 +370,6 @@ def score_relevance(
         logger.info("Gemini unavailable and no keywords — returning default scores.")
         return [0.5] * len(results)
 
-    # LLM path: process in batches
     all_scores: list[float] = []
     batches = _chunk_list(results, BATCH_SIZE)
 
@@ -382,41 +398,29 @@ Normativos:
 Retorne APENAS um JSON array de números (floats), na mesma ordem dos normativos acima.
 Exemplo: [0.9, 0.3, 0.7, 0.1]'''
 
-        try:
-            response = client.generate_content(
-                prompt,
-                generation_config=genai.types.GenerationConfig(
-                    temperature=0.0,
-                    max_output_tokens=512,
-                ),
+        text = _generate(prompt, temperature=0.0, max_tokens=512)
+        if not text:
+            logger.warning("Gemini returned empty response for relevance batch %d.", batch_idx)
+            all_scores.extend([0.5] * len(batch))
+            continue
+
+        parsed = _parse_json_array(text)
+        if parsed is not None and len(parsed) == len(batch):
+            batch_scores = []
+            for val in parsed:
+                try:
+                    score = float(val)
+                    score = max(0.0, min(1.0, score))
+                except (TypeError, ValueError):
+                    score = 0.5
+                batch_scores.append(score)
+            all_scores.extend(batch_scores)
+        else:
+            logger.warning(
+                "Batch %d: expected %d scores, got %s. Using 0.5 fallback.",
+                batch_idx, len(batch),
+                len(parsed) if parsed else "None",
             )
-
-            if not response.text:
-                logger.warning("Gemini returned empty response for relevance batch %d.", batch_idx)
-                all_scores.extend([0.5] * len(batch))
-                continue
-
-            parsed = _parse_json_array(response.text)
-            if parsed is not None and len(parsed) == len(batch):
-                batch_scores = []
-                for val in parsed:
-                    try:
-                        score = float(val)
-                        score = max(0.0, min(1.0, score))  # Clamp to [0.0, 1.0]
-                    except (TypeError, ValueError):
-                        score = 0.5  # Default for unparseable individual scores
-                    batch_scores.append(score)
-                all_scores.extend(batch_scores)
-            else:
-                logger.warning(
-                    "Batch %d: expected %d scores, got %s. Using 0.5 fallback.",
-                    batch_idx, len(batch),
-                    len(parsed) if parsed else "None",
-                )
-                all_scores.extend([0.5] * len(batch))
-
-        except Exception as e:
-            logger.warning("Gemini API error in relevance batch %d: %s", batch_idx, e)
             all_scores.extend([0.5] * len(batch))
 
         # Rate limiting for large result sets (>200 items = >10 batches)
@@ -434,25 +438,18 @@ def categorize_results(topic: str, results: list[dict]) -> list[str]:
     "Não categorizado" for all results.
 
     Args:
-        topic: The original research topic (provides context for categorization).
+        topic: The original research topic.
         results: List of dicts with "nome" and "ementa" keys.
 
     Returns:
-        List of category strings, same length and order as ``results``.
-        Each string is guaranteed to be from CATEGORIES or "Não categorizado".
-
-    Example:
-        >>> categorize_results("LGPD", [{"nome": "Lei 13.709", "ementa": "Proteção de dados..."}])
-        ["Proteção de Dados"]
+        List of category strings, same length and order as results.
     """
-    # Sanitize: truncate excessively long topic strings
     topic = (topic or "")[:500].strip()
 
     if not results:
         return []
 
-    client = _get_client()
-    if client is None:
+    if not is_available():
         logger.info("Gemini unavailable — returning uncategorized for all results.")
         return ["Não categorizado"] * len(results)
 
@@ -477,40 +474,27 @@ Normativos:
 Retorne APENAS um JSON array de strings com a categoria de cada normativo, na mesma ordem.
 Exemplo: ["Governança de TI", "Segurança da Informação", "Outro"]'''
 
-        try:
-            response = client.generate_content(
-                prompt,
-                generation_config=genai.types.GenerationConfig(
-                    temperature=0.0,
-                    max_output_tokens=512,
-                ),
+        text = _generate(prompt, temperature=0.0, max_tokens=512)
+        if not text:
+            logger.warning("Gemini returned empty response for categorize batch %d.", batch_idx)
+            all_categories.extend(["Não categorizado"] * len(batch))
+            continue
+
+        parsed = _parse_json_array(text)
+        if parsed is not None and len(parsed) == len(batch):
+            for val in parsed:
+                val_str = str(val).strip()
+                if val_str in CATEGORIES:
+                    all_categories.append(val_str)
+                else:
+                    matched = _fuzzy_match_category(val_str)
+                    all_categories.append(matched if matched else "Outro")
+        else:
+            logger.warning(
+                "Batch %d: expected %d categories, got %s. Using fallback.",
+                batch_idx, len(batch),
+                len(parsed) if parsed else "None",
             )
-
-            if not response.text:
-                logger.warning("Gemini returned empty response for categorize batch %d.", batch_idx)
-                all_categories.extend(["Não categorizado"] * len(batch))
-                continue
-
-            parsed = _parse_json_array(response.text)
-            if parsed is not None and len(parsed) == len(batch):
-                for val in parsed:
-                    val_str = str(val).strip()
-                    if val_str in CATEGORIES:
-                        all_categories.append(val_str)
-                    else:
-                        # Attempt fuzzy match for LLM output variations
-                        matched = _fuzzy_match_category(val_str)
-                        all_categories.append(matched if matched else "Outro")
-            else:
-                logger.warning(
-                    "Batch %d: expected %d categories, got %s. Using fallback.",
-                    batch_idx, len(batch),
-                    len(parsed) if parsed else "None",
-                )
-                all_categories.extend(["Não categorizado"] * len(batch))
-
-        except Exception as e:
-            logger.warning("Gemini API error in categorize batch %d: %s", batch_idx, e)
             all_categories.extend(["Não categorizado"] * len(batch))
 
         # Rate limiting for large result sets (>200 items = >10 batches)

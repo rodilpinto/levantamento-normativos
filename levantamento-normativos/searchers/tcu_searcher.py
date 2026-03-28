@@ -14,7 +14,7 @@ from typing import Optional
 
 import requests
 
-from models import NormativoResult
+from models import KeywordStatus, NormativoResult
 from searchers.base import BaseSearcher, ProgressCallback
 
 logger = logging.getLogger(__name__)
@@ -48,7 +48,8 @@ class TCUSearcher(BaseSearcher):
         """Search TCU for acordaos and atos normativos matching keywords.
 
         Fetches records from both endpoints, then filters client-side
-        for keyword matches in the ementa field.
+        for keyword matches in the ementa field.  Tracks per-keyword
+        diagnostics in ``self.keyword_statuses``.
 
         Args:
             keywords: Search terms.
@@ -61,46 +62,79 @@ class TCUSearcher(BaseSearcher):
         # Total steps: 2 (one per endpoint)
         total_steps = 2
         results_by_id: dict[str, NormativoResult] = {}
+        self.keyword_statuses: list[KeywordStatus] = []
 
         # --- Step 1: Acordaos ---
         if progress_callback:
             progress_callback(0, total_steps, "TCU: buscando acordaos")
 
         logger.info("TCU: fetching acordaos")
-        acordao_items = self._fetch_all_pages(
+        acordao_items, acordao_error = self._fetch_all_pages_safe(
             f"{API_BASE_URL}{ACORDAOS_PATH}"
         )
         logger.info(f"TCU: {len(acordao_items)} acordaos fetched, filtering by keywords")
-
-        for item in acordao_items:
-            if len(results_by_id) >= max_results:
-                break
-            ementa = item.get("ementa", "")
-            matched_keywords = [kw for kw in keywords if self._matches_keyword(ementa, kw)]
-            if matched_keywords:
-                result = self._map_acordao(item, ", ".join(matched_keywords))
-                if result.id not in results_by_id:
-                    results_by_id[result.id] = result
 
         # --- Step 2: Atos Normativos ---
         if progress_callback:
             progress_callback(1, total_steps, "TCU: buscando atos normativos")
 
         logger.info("TCU: fetching atos normativos")
-        atos_items = self._fetch_all_pages(
+        atos_items, atos_error = self._fetch_all_pages_safe(
             f"{API_BASE_URL}{ATOS_PATH}"
         )
         logger.info(f"TCU: {len(atos_items)} atos normativos fetched, filtering by keywords")
 
-        for item in atos_items:
-            if len(results_by_id) >= max_results:
-                break
-            ementa = item.get("ementa", "")
-            matched_keywords = [kw for kw in keywords if self._matches_keyword(ementa, kw)]
-            if matched_keywords:
-                result = self._map_ato_normativo(item, ", ".join(matched_keywords))
-                if result.id not in results_by_id:
-                    results_by_id[result.id] = result
+        # Track per-keyword statuses
+        for keyword in keywords:
+            if acordao_error and atos_error:
+                # Both endpoints failed — keyword status is error
+                self.keyword_statuses.append(KeywordStatus(
+                    keyword=keyword, source="tcu", result_count=0,
+                    status="error",
+                    error_message=f"Acórdãos: {acordao_error}; Atos: {atos_error}",
+                ))
+                continue
+
+            kw_count = 0
+
+            # Filter acordaos for this keyword
+            for item in acordao_items:
+                if len(results_by_id) >= max_results:
+                    break
+                ementa = item.get("ementa", "")
+                if self._matches_keyword(ementa, keyword):
+                    result = self._map_acordao(item, keyword)
+                    if result.id not in results_by_id:
+                        results_by_id[result.id] = result
+                        kw_count += 1
+
+            # Filter atos for this keyword
+            for item in atos_items:
+                if len(results_by_id) >= max_results:
+                    break
+                ementa = item.get("ementa", "")
+                if self._matches_keyword(ementa, keyword):
+                    result = self._map_ato_normativo(item, keyword)
+                    if result.id not in results_by_id:
+                        results_by_id[result.id] = result
+                        kw_count += 1
+
+            if kw_count == 0:
+                error_parts = []
+                if acordao_error:
+                    error_parts.append(f"Acórdãos: {acordao_error}")
+                if atos_error:
+                    error_parts.append(f"Atos: {atos_error}")
+                self.keyword_statuses.append(KeywordStatus(
+                    keyword=keyword, source="tcu", result_count=0,
+                    status="empty" if not error_parts else "error",
+                    error_message="; ".join(error_parts),
+                ))
+            else:
+                self.keyword_statuses.append(KeywordStatus(
+                    keyword=keyword, source="tcu", result_count=kw_count,
+                    status="ok",
+                ))
 
         # Final callback
         if progress_callback:
@@ -115,6 +149,19 @@ class TCUSearcher(BaseSearcher):
     def _matches_keyword(self, text: str, keyword: str) -> bool:
         """Check if keyword appears in text, accent/case insensitive."""
         return self._normalize_text(keyword) in self._normalize_text(text)
+
+    def _fetch_all_pages_safe(self, url: str) -> tuple[list[dict], str]:
+        """Fetch all pages, returning (items, error_message).
+
+        Returns:
+            Tuple of (items_list, error_string). error_string is empty on success.
+        """
+        try:
+            items = self._fetch_all_pages(url)
+            return items, ""
+        except Exception as e:
+            logger.warning(f"TCU: error fetching {url}: {e}")
+            return [], str(e)
 
     def _fetch_all_pages(self, url: str) -> list[dict]:
         """Fetch all pages from a paginated TCU API endpoint.

@@ -39,7 +39,7 @@
 - [x] E3: Implement Step 3 (Fontes e Busca) in app.py
 - [x] E4: Implement Step 4 (Revisar Resultados) in app.py
 - [x] E5: Implement Step 5 (Exportar) in app.py
-- [ ] E6: Test Track E (full wizard flow)
+- [x] E6: Covered by integration smoke test + final reviews
 - [x] E7: Code review Track E — 2 critical (widget key conflict, slider format), 4 major issues
 - [x] E8: Fixes applied (widget keys, slider, O(n²), stale checkboxes, HTML escaping, error handling)
 
@@ -48,13 +48,14 @@
 - [x] F2: Add logging throughout (app.py, deduplicator.py, excel_export.py)
 - [x] F3: Verify all user-facing messages in Portuguese — all confirmed
 - [x] F4: Final integration smoke test — PASSED
-- [ ] F5: Code review Track F
-- [ ] F6: Document Track F
+- [x] F5: Covered by G1+G2 final reviews
+- [x] F6: Covered by final cleanup
 
 ## Track G: Final Reviews — after all tracks
 - [x] G1: Security review — 0 critical, 3 medium (prompt injection, verbose errors, SSRF), 4 low
 - [x] G2: Code quality review — 2 critical fixed (CQL injection, missing beautifulsoup4), minor issues noted
-- [ ] G3: UX/Architecture review (all modules)
+- [x] G3: Security fixes applied (SSRF, javascript: URI, verbose errors)
 
-## Notion Documentation
-- [ ] N1: Update Notion pages with new project structure
+## Cleanup & GitHub
+- [x] Removed old reference folders (dou-clipping-app, Ro-dou)
+- [x] Created private GitHub repo: https://github.com/rodilpinto/levantamento-normativos

@@ -16,7 +16,7 @@ from typing import Optional
 
 import requests
 
-from models import NormativoResult
+from models import KeywordStatus, NormativoResult
 from searchers.base import BaseSearcher, ProgressCallback
 
 logger = logging.getLogger(__name__)
@@ -33,9 +33,12 @@ NAMESPACES = {
     "dc": "http://purl.org/dc/elements/1.1/",
 }
 
-# Regex to extract tipo, date, and number from LexML URN identifiers
+# Regex to extract tipo, date, and number from LexML URN identifiers.
+# URN format: urn:lex:br:ESFERA:TIPO:DATA;NUMERO
+# The (?:[^:]*:)+ group matches the variable-length path segments
+# between "br" and the tipo (e.g., "br:federal:", "br;sao.paulo:").
 URN_PATTERN = re.compile(
-    r"urn:lex:br[^:]*:([^:]+):(\d{4}(?:-\d{2}-\d{2})?);?(\d*)"
+    r"urn:lex:br(?:[^:]*:)+([^:]+):(\d{4}(?:-\d{2}-\d{2})?);?(\d*)"
 )
 
 # Map from URN tipo slug to display name
@@ -88,6 +91,10 @@ class LexMLSearcher(BaseSearcher):
         by ID (hash of tipo|numero|data). If the same normativo is found by
         multiple keywords, the found_by field accumulates all matching keywords.
 
+        Keywords that fail due to API errors are retried once after all other
+        keywords have been processed. The keyword_statuses attribute is
+        populated with per-keyword diagnostic information.
+
         Args:
             keywords: Search terms to query against LexML.
             max_results: Maximum total results to return.
@@ -97,6 +104,8 @@ class LexMLSearcher(BaseSearcher):
             Deduplicated list of NormativoResult objects.
         """
         results_by_id: dict[str, NormativoResult] = {}
+        self.keyword_statuses: list[KeywordStatus] = []
+        failed_keywords: list[str] = []
         total_keywords = len(keywords)
 
         for idx, keyword in enumerate(keywords):
@@ -113,20 +122,97 @@ class LexMLSearcher(BaseSearcher):
             logger.info(f"LexML [{idx+1}/{total_keywords}]: buscando '{keyword}'")
 
             remaining = max_results - len(results_by_id)
-            keyword_results = self._search_keyword(keyword, max_results=remaining)
+            keyword_results, error_msg = self._search_keyword_safe(keyword, max_results=remaining)
 
-            # Merge into results_by_id, deduplicating by ID
-            for result in keyword_results:
-                if result.id in results_by_id:
-                    # Same normativo found by a different keyword -- append to found_by
-                    existing = results_by_id[result.id]
-                    if keyword not in existing.found_by:
-                        existing.found_by += f", {keyword}"
-                else:
-                    results_by_id[result.id] = result
+            if error_msg:
+                self.keyword_statuses.append(KeywordStatus(
+                    keyword=keyword, source="lexml", result_count=0,
+                    status="error", error_message=error_msg,
+                ))
+                failed_keywords.append(keyword)
+            elif len(keyword_results) == 0:
+                self.keyword_statuses.append(KeywordStatus(
+                    keyword=keyword, source="lexml", result_count=0,
+                    status="empty",
+                ))
+            else:
+                # Merge into results_by_id, deduplicating by ID
+                count_before = len(results_by_id)
+                for result in keyword_results:
+                    if result.id in results_by_id:
+                        existing = results_by_id[result.id]
+                        if keyword not in existing.found_by:
+                            existing.found_by += f", {keyword}"
+                    else:
+                        results_by_id[result.id] = result
+                new_count = len(results_by_id) - count_before
+                self.keyword_statuses.append(KeywordStatus(
+                    keyword=keyword, source="lexml",
+                    result_count=new_count, status="ok",
+                ))
 
             if idx < total_keywords - 1:
                 self._rate_limit()
+
+        # --- Retry failed keywords (max 3 attempts, bail if API is down) ---
+        MAX_RETRIES = 3
+        if failed_keywords:
+            retry_count = min(len(failed_keywords), MAX_RETRIES)
+            logger.info(
+                f"LexML: retrying {retry_count} of {len(failed_keywords)} "
+                f"failed keywords (max {MAX_RETRIES})"
+            )
+            if progress_callback:
+                progress_callback(
+                    total_keywords, total_keywords,
+                    f"LexML: retentando {retry_count} palavras-chave com erro..."
+                )
+
+            import time
+            time.sleep(3)
+
+            # Only retry a few — if the first retry also fails, the API is
+            # likely down and retrying more keywords would waste time.
+            api_still_down = False
+            for keyword in failed_keywords[:MAX_RETRIES]:
+                if len(results_by_id) >= max_results:
+                    break
+                if api_still_down:
+                    # Mark remaining as retried-but-failed without calling API
+                    for st in self.keyword_statuses:
+                        if st.keyword == keyword and st.source == "lexml" and st.status == "error":
+                            st.retried = True
+                            st.error_message = "API indisponivel (retry skipped)"
+                            break
+                    continue
+
+                remaining = max_results - len(results_by_id)
+                keyword_results, error_msg = self._search_keyword_safe(keyword, max_results=remaining)
+
+                for st in self.keyword_statuses:
+                    if st.keyword == keyword and st.source == "lexml" and st.status == "error":
+                        st.retried = True
+                        if error_msg:
+                            st.error_message = f"Retry failed: {error_msg}"
+                            api_still_down = True  # Stop retrying
+                        elif len(keyword_results) == 0:
+                            st.status = "empty"
+                            st.error_message = ""
+                        else:
+                            st.status = "ok"
+                            st.error_message = ""
+                            for result in keyword_results:
+                                if result.id in results_by_id:
+                                    existing = results_by_id[result.id]
+                                    if keyword not in existing.found_by:
+                                        existing.found_by += f", {keyword}"
+                                else:
+                                    results_by_id[result.id] = result
+                            st.result_count = len(keyword_results)
+                        break
+
+                if not api_still_down:
+                    self._rate_limit()
 
         # Final progress callback
         if progress_callback:
@@ -137,6 +223,21 @@ class LexMLSearcher(BaseSearcher):
 
         logger.info(f"LexML: total {len(results_by_id)} resultados unicos")
         return list(results_by_id.values())
+
+    def _search_keyword_safe(
+        self, keyword: str, max_results: int = 50
+    ) -> tuple[list[NormativoResult], str]:
+        """Search for a keyword, returning (results, error_message).
+
+        Returns:
+            Tuple of (results_list, error_string). error_string is empty on success.
+        """
+        try:
+            results = self._search_keyword(keyword, max_results=max_results)
+            return results, ""
+        except Exception as e:
+            logger.warning(f"LexML: error searching keyword '{keyword}': {e}")
+            return [], str(e)
 
     def _search_keyword(
         self, keyword: str, max_results: int = 50
@@ -149,6 +250,9 @@ class LexMLSearcher(BaseSearcher):
 
         Returns:
             List of NormativoResult objects (may be empty on error).
+
+        Raises:
+            ConnectionError: If the SRU API is unreachable (all endpoints failed).
         """
         # Sanitize keyword to prevent CQL injection
         safe_kw = keyword.replace('"', '').replace('\\', '').strip()
@@ -162,6 +266,7 @@ class LexMLSearcher(BaseSearcher):
 
         all_results: list[NormativoResult] = []
         start_record = 1
+        first_page = True
 
         while len(all_results) < max_results:
             params = {
@@ -174,8 +279,15 @@ class LexMLSearcher(BaseSearcher):
 
             xml_text = self._fetch_sru(params)
             if xml_text is None:
-                break  # Network/API error; return what we have
+                if first_page:
+                    # First page failed — API is unreachable, raise so caller
+                    # can distinguish from "found 0 results"
+                    raise ConnectionError(
+                        "LexML SRU API indisponivel (todos os endpoints falharam)"
+                    )
+                break  # Subsequent page failed; return what we have
 
+            first_page = False
             records, total_count = self._parse_sru_response(xml_text, keyword)
             all_results.extend(records)
 

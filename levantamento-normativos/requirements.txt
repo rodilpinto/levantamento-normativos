@@ -2,5 +2,6 @@ streamlit>=1.33.0
 requests
 openpyxl
 beautifulsoup4
-google-generativeai
+google-genai
+ddgs
 googlesearch-python
